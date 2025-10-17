@@ -190,7 +190,7 @@ function acquireWorkflowStateLock(operation = 'access', priority = 'normal') {
           fs.readFileSync(WORKFLOW_STATE_LOCK_FILE, 'utf8')
         );
         const lockAge = Date.now() - new Date(existingLock.timestamp).getTime();
-        const MAX_LOCK_AGE = 5 * 60 * 1000; // 5 minutes max lock age
+        const MAX_LOCK_AGE = 60 * 60 * 1000; // 60 minutes max lock age
 
         // Enhanced lock stealing with process verification
         const processDead = !isProcessRunning(existingLock.pid);
@@ -1109,12 +1109,12 @@ function runBMADAgentImmediate(agentType, command, storyPath, options = {}) {
 
   // Adaptive timeout based on agent type, story complexity, and system load
   const baseTimeouts = {
-    analyst: 900000, // 15 minutes base for analysis
-    pm: 600000, // 10 minutes base for review
-    sm: 450000, // 7.5 minutes base for splitting
-    architect: 1200000, // 20 minutes base for design
-    dev: 1800000, // 30 minutes base for development
-    qa: 900000, // 15 minutes base for testing
+    analyst: 1800000, // 30 minutes base for analysis
+    pm: 1200000, // 20 minutes base for review
+    sm: 900000, // 15 minutes base for splitting
+    architect: 1800000, // 30 minutes base for design
+    dev: 3600000, // 60 minutes base for development
+    qa: 1200000, // 20 minutes base for testing
   };
 
   // Calculate adaptive timeout based on story size and complexity
@@ -1414,7 +1414,7 @@ function acquireStoryLock(storyFilename, command) {
       try {
         const existingLock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
         const lockAge = Date.now() - new Date(existingLock.timestamp).getTime();
-        const MINUTES = 15 * 60 * 1000;
+        const MINUTES = 60 * 60 * 1000;
 
         // Lock stealing: if process is dead OR lock is older than 5 minutes
         if (!isProcessRunning(existingLock.pid) || lockAge > MINUTES) {
@@ -1567,7 +1567,7 @@ function isProcessRunning(pid) {
  * Clean up stale locks from dead processes
  */
 function cleanupStaleLocks() {
-  const MINUTES = 15 * 60 * 1000; // 15 minutes in milliseconds
+  const MINUTES = 60 * 60 * 1000; // 60 minutes in milliseconds
 
   try {
     if (!fs.existsSync(LOCKS_DIR)) {
@@ -1586,7 +1586,7 @@ function cleanupStaleLocks() {
         const lockTime = new Date(lockData.timestamp).getTime();
         const now = Date.now();
 
-        // Check if lock is older than 5 minutes OR process is dead
+        // Check if lock is older than minutes OR process is dead
         if (now - lockTime > MINUTES || !isProcessRunning(lockData.pid)) {
           try {
             fs.unlinkSync(lockPath);
@@ -1622,7 +1622,7 @@ function cleanupStaleLocks() {
       const lockTime = new Date(lockData.timestamp).getTime();
       const now = Date.now();
 
-      // Check if workflow state lock is older than 5 minutes OR process is dead
+      // Check if workflow state lock is older than minutes OR process is dead
       if (now - lockTime > MINUTES || !isProcessRunning(lockData.pid)) {
         try {
           fs.unlinkSync(WORKFLOW_STATE_LOCK_FILE);
@@ -1754,6 +1754,9 @@ async function runBot() {
       logWarning(`⏳ Skipping locked story: ${story.filename}`);
       continue;
     }
+
+    const storyKey = story.filename.replace(/\.md$/, '');
+    setBotOperation(storyKey, story.path);
 
     try {
       checkFileSize(story.path);
@@ -1897,6 +1900,7 @@ async function runBot() {
       );
       // Don't set to error state - leave in current state for retry by another agent
     } finally {
+      clearBotOperation();
       releaseStoryLock(story.filename, 'bot');
     }
   }
@@ -2969,9 +2973,10 @@ let shutdownRequested = false;
 
 // Global current operation tracking for graceful shutdown
 let currentOperation = {
-  stage: null, // 'dev', 'qa', 'architect', etc.
+  stage: null, // 'dev', 'qa', 'architect', 'bot'
   storyPath: null,
   startTime: null,
+  botStoryKey: null, // Track current story being processed by bot command
 };
 
 /**
@@ -2982,24 +2987,57 @@ function setCurrentOperation(stage, storyPath) {
     stage,
     storyPath,
     startTime: Date.now(),
+    botStoryKey: currentOperation.botStoryKey, // Preserve bot story key
   };
   logInfo(`🔄 Started ${stage} operation for ${path.basename(storyPath)}`);
 }
 
 /**
- * Clear current operation stage
+ * Set bot operation tracking for graceful shutdown
  */
-function clearCurrentOperation() {
-  if (currentOperation.stage) {
+function setBotOperation(storyKey, storyPath) {
+  currentOperation = {
+    stage: 'bot',
+    storyPath,
+    startTime: Date.now(),
+    botStoryKey: storyKey,
+  };
+  logInfo(`🔄 Started bot processing for story: ${storyKey}`);
+}
+
+/**
+ * Clear bot operation tracking
+ */
+function clearBotOperation() {
+  if (currentOperation.stage === 'bot') {
     const duration = Date.now() - currentOperation.startTime;
     logInfo(
-      `✅ Completed ${currentOperation.stage} operation for ${path.basename(currentOperation.storyPath)} (${Math.round(duration / 1000)}s)`
+      `✅ Completed bot processing for story: ${currentOperation.botStoryKey} (${Math.round(duration / 1000)}s)`
     );
   }
   currentOperation = {
     stage: null,
     storyPath: null,
     startTime: null,
+    botStoryKey: null,
+  };
+}
+
+/**
+ * Clear current operation stage
+ */
+function clearCurrentOperation() {
+  if (currentOperation.stage && currentOperation.stage !== 'bot') {
+    const duration = Date.now() - currentOperation.startTime;
+    logInfo(
+      `✅ Completed ${currentOperation.stage} operation for ${path.basename(currentOperation.storyPath)} (${Math.round(duration / 1000)}s)`
+    );
+  }
+  currentOperation = {
+    stage: currentOperation.botStoryKey ? 'bot' : null, // Preserve bot stage if active
+    storyPath: currentOperation.botStoryKey ? currentOperation.storyPath : null,
+    startTime: currentOperation.botStoryKey ? currentOperation.startTime : null,
+    botStoryKey: currentOperation.botStoryKey, // Preserve bot story key
   };
 }
 
@@ -3016,7 +3054,7 @@ function acquireOrchestratorInstanceLock() {
       try {
         const lockData = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
         const lockAge = Date.now() - new Date(lockData.timestamp).getTime();
-        const MAX_INSTANCE_AGE = 30 * 60 * 1000; // 30 minutes max instance age
+        const MAX_INSTANCE_AGE = 60 * 60 * 1000; // 60 minutes max instance age
 
         // Check if process is still running or lock is too old
         if (!isProcessRunning(lockData.pid) || lockAge > MAX_INSTANCE_AGE) {
@@ -3142,6 +3180,29 @@ async function gracefulShutdown(signal, exitCode) {
 
   const instanceId = process.env.BMAD_INSTANCE_ID || 'default';
 
+  // Special handling for bot operations - wait for entire story processing to complete
+  if (currentOperation.stage === 'bot') {
+    console.log(
+      `🤖 BOT OPERATION DETECTED: Waiting for current story processing to complete before shutdown...`
+    );
+    console.log(
+      `📝 Allowing story ${currentOperation.botStoryKey} to finish completely (including file cleanup)`
+    );
+
+    // Wait until bot operation completes (no timeout - let it finish)
+    const waitStartTime = Date.now();
+
+    while (currentOperation.stage === 'bot') {
+      console.log(
+        `⏳ Waiting for story ${currentOperation.botStoryKey} processing to complete... (${Math.round((Date.now() - waitStartTime) / 1000)}s elapsed)`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10000)); // Check every 10 seconds
+    }
+
+    console.log(
+      `✅ Story ${currentOperation.botStoryKey} processing completed gracefully before shutdown`
+    );
+  }
   // Special handling for dev and architect stages - wait for critical operations to complete
   if (
     currentOperation.stage === 'dev' ||
@@ -3160,7 +3221,7 @@ async function gracefulShutdown(signal, exitCode) {
     );
 
     // Wait up to 5 minutes for operation to complete
-    const maxWaitTime = 10 * 60 * 1000; // 10 minutes
+    const maxWaitTime = 60 * 60 * 1000; // 60 minutes
     const waitStartTime = Date.now();
     const initialStage = currentOperation.stage;
 
