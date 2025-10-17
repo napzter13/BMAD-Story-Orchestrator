@@ -19,6 +19,25 @@ const { execSync } = require('child_process');
 const STORIES_DIR = path.join(__dirname, '..', 'apps', 'web', 'stories');
 const WORKFLOW_STATE_FILE = path.join(STORIES_DIR, '.workflow-state.json');
 
+// Process management and queuing system
+const PROCESS_CONFIG = {
+  MAX_CONCURRENT_PROCESSES: 3, // Maximum concurrent cursor-agent processes
+  MAX_PROCESSES_PER_AGENT_TYPE: 2, // Max processes per agent type
+  PROCESS_QUEUE_CHECK_INTERVAL: 5000, // Check queue every 5 seconds
+  PROCESS_CLEANUP_INTERVAL: 30000, // Cleanup dead processes every 30 seconds
+  MAX_PROCESS_AGE: 3600000, // Kill processes older than 1 hour
+  QUEUE_TIMEOUT: 7200000, // Remove queued items after 2 hours
+};
+
+// Health monitoring and circuit breaker
+const HEALTH_CONFIG = {
+  HEALTH_CHECK_INTERVAL: 60000, // Check health every minute
+  CIRCUIT_BREAKER_FAILURE_THRESHOLD: 5, // Open circuit after 5 failures
+  CIRCUIT_BREAKER_RECOVERY_TIMEOUT: 300000, // Try to close circuit after 5 minutes
+  MAX_MEMORY_USAGE: 0.8, // Alert if memory usage > 80%
+  MAX_CPU_USAGE: 0.9, // Alert if CPU usage > 90%
+};
+
 // Allow multiple concurrent instances - no global lock file
 
 const WORKFLOW_STATES = {
@@ -35,6 +54,43 @@ const ORCHESTRATOR_INSTANCE_LOCK_FILE = path.join(
   STORIES_DIR,
   '.orchestrator-instance.lock'
 );
+
+// Global process queue and tracking
+let processQueue = [];
+let activeProcesses = new Map(); // pid -> process info
+let processQueueInterval = null;
+let processCleanupInterval = null;
+
+// Health monitoring and circuit breaker state
+let healthMonitorInterval = null;
+let circuitBreakerState = {
+  isOpen: false,
+  failureCount: 0,
+  lastFailureTime: 0,
+  lastAttemptTime: 0,
+};
+let systemHealth = {
+  memoryUsage: 0,
+  cpuUsage: 0,
+  activeProcesses: 0,
+  queuedProcesses: 0,
+  recentErrors: [],
+  lastHealthCheck: 0,
+};
+
+// Metrics tracking
+let systemMetrics = {
+  startTime: Date.now(),
+  totalProcessesStarted: 0,
+  totalProcessesCompleted: 0,
+  totalProcessesFailed: 0,
+  totalRetries: 0,
+  averageProcessDuration: 0,
+  peakConcurrentProcesses: 0,
+  totalQueuedTime: 0,
+  agentTypeMetrics: new Map(), // agentType -> {started, completed, failed, avgDuration}
+  commandMetrics: new Map(), // command -> {count, avgDuration}
+};
 
 // Color codes for terminal output
 const colors = {
@@ -118,9 +174,9 @@ function updateStoryWorkflowState(storyFilename, newState, state) {
 }
 
 /**
- * Acquire an atomic lock for workflow state file access
+ * Acquire an atomic lock for workflow state file access with improved reliability
  */
-function acquireWorkflowStateLock(operation = 'access') {
+function acquireWorkflowStateLock(operation = 'access', priority = 'normal') {
   try {
     // Ensure locks directory exists
     if (!fs.existsSync(LOCKS_DIR)) {
@@ -136,10 +192,18 @@ function acquireWorkflowStateLock(operation = 'access') {
         const lockAge = Date.now() - new Date(existingLock.timestamp).getTime();
         const MAX_LOCK_AGE = 5 * 60 * 1000; // 5 minutes max lock age
 
-        // Lock stealing: if process is dead OR lock is older than max age
-        if (!isProcessRunning(existingLock.pid) || lockAge > MAX_LOCK_AGE) {
+        // Enhanced lock stealing with process verification
+        const processDead = !isProcessRunning(existingLock.pid);
+        const lockExpired = lockAge > MAX_LOCK_AGE;
+        const sameOperation = existingLock.operation === operation;
+
+        if (
+          processDead ||
+          lockExpired ||
+          (sameOperation && priority === 'high')
+        ) {
           logWarning(
-            `🔓 Stealing stale workflow state lock (PID: ${existingLock.pid}, age: ${Math.round(lockAge / 1000)}s)`
+            `🔓 Stealing workflow state lock (PID: ${existingLock.pid}, age: ${Math.round(lockAge / 1000)}s, reason: ${processDead ? 'dead' : lockExpired ? 'expired' : 'priority'})`
           );
           fs.unlinkSync(WORKFLOW_STATE_LOCK_FILE);
         } else {
@@ -157,7 +221,10 @@ function acquireWorkflowStateLock(operation = 'access') {
     const lockData = {
       pid: process.pid,
       operation,
+      priority,
+      instanceId: process.env.BMAD_INSTANCE_ID || 'default',
       timestamp: new Date().toISOString(),
+      heartbeat: Date.now(),
     };
 
     fs.writeFileSync(
@@ -185,6 +252,25 @@ function releaseWorkflowStateLock() {
     }
   } catch (error) {
     logWarning(`Could not release workflow state lock: ${error.message}`);
+  }
+}
+
+/**
+ * Update heartbeat for active lock to prevent premature stealing
+ */
+function updateLockHeartbeat(lockFile, operation = null) {
+  try {
+    if (fs.existsSync(lockFile)) {
+      const lockData = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+      // Only update if this process owns the lock
+      if (lockData.pid === process.pid) {
+        lockData.heartbeat = Date.now();
+        if (operation) lockData.operation = operation;
+        fs.writeFileSync(lockFile, JSON.stringify(lockData, null, 2));
+      }
+    }
+  } catch (error) {
+    // Silently fail - heartbeat is not critical
   }
 }
 
@@ -340,9 +426,658 @@ function readStoryFile(storyPath) {
 }
 
 /**
- * Execute BMAD agent using cursor-agent CLI
+ * Initialize process management system
+ */
+function initializeProcessManagement() {
+  if (!processQueueInterval) {
+    processQueueInterval = setInterval(
+      processQueueHandler,
+      PROCESS_CONFIG.PROCESS_QUEUE_CHECK_INTERVAL
+    );
+    logInfo('🔄 Started process queue handler');
+  }
+
+  if (!processCleanupInterval) {
+    processCleanupInterval = setInterval(
+      cleanupDeadProcesses,
+      PROCESS_CONFIG.PROCESS_CLEANUP_INTERVAL
+    );
+    logInfo('🧹 Started process cleanup handler');
+  }
+
+  if (!healthMonitorInterval) {
+    healthMonitorInterval = setInterval(
+      healthCheck,
+      HEALTH_CONFIG.HEALTH_CHECK_INTERVAL
+    );
+    logInfo('🏥 Started health monitoring');
+  }
+}
+
+/**
+ * Cleanup dead processes and update tracking
+ */
+function cleanupDeadProcesses() {
+  const now = Date.now();
+  let cleaned = 0;
+
+  for (const [pid, processInfo] of activeProcesses.entries()) {
+    // Check if process is still running
+    try {
+      process.kill(pid, 0); // Signal 0 just checks if process exists
+    } catch (error) {
+      // Process is dead
+      logWarning(
+        `🧹 Cleaned up dead process: ${processInfo.agentType} (PID: ${pid})`
+      );
+      activeProcesses.delete(pid);
+      cleaned++;
+      continue;
+    }
+
+    // Check if process is too old
+    const age = now - processInfo.startTime;
+    if (age > PROCESS_CONFIG.MAX_PROCESS_AGE) {
+      logWarning(
+        `⏰ Killing old process: ${processInfo.agentType} (PID: ${pid}, age: ${Math.round(age / 60000)}min)`
+      );
+      try {
+        process.kill(pid, 'SIGTERM');
+        setTimeout(() => {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch (e) {
+            /* ignore */
+          }
+        }, 5000);
+      } catch (error) {
+        logWarning(`Could not kill old process ${pid}: ${error.message}`);
+      }
+      activeProcesses.delete(pid);
+      cleaned++;
+    }
+  }
+
+  // Also clean up orphaned locks
+  let locksCleaned = 0;
+  try {
+    if (fs.existsSync(LOCKS_DIR)) {
+      const lockFiles = fs
+        .readdirSync(LOCKS_DIR)
+        .filter((file) => file.endsWith('.lock'));
+      for (const lockFile of lockFiles) {
+        const lockPath = path.join(LOCKS_DIR, lockFile);
+        try {
+          const lockData = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+          // Check if the process that created this lock is still running
+          try {
+            process.kill(lockData.pid, 0);
+          } catch (error) {
+            // Process is dead, remove the lock
+            fs.unlinkSync(lockPath);
+            locksCleaned++;
+          }
+        } catch (error) {
+          // Corrupted lock file, remove it
+          fs.unlinkSync(lockPath);
+          locksCleaned++;
+        }
+      }
+    }
+  } catch (error) {
+    logWarning(`Could not cleanup orphaned locks: ${error.message}`);
+  }
+
+  if (cleaned > 0 || locksCleaned > 0) {
+    logInfo(
+      `🧹 Cleaned up ${cleaned} processes and ${locksCleaned} orphaned locks`
+    );
+  }
+}
+
+/**
+ * Health check function - monitors system health and manages circuit breaker
+ */
+function healthCheck() {
+  const now = Date.now();
+
+  try {
+    // Update basic health metrics
+    systemHealth.activeProcesses = activeProcesses.size;
+    systemHealth.queuedProcesses = processQueue.length;
+    systemHealth.lastHealthCheck = now;
+
+    // Check memory usage
+    const memUsage = process.memoryUsage();
+    systemHealth.memoryUsage = memUsage.heapUsed / memUsage.heapTotal;
+
+    // Simple CPU usage estimation (rough approximation)
+    const uptime = process.uptime();
+    systemHealth.cpuUsage = Math.min(1.0, activeProcesses.size * 0.1); // Rough estimate
+
+    // Check if system is healthy
+    const isHealthy = checkSystemHealth();
+
+    if (!isHealthy && !circuitBreakerState.isOpen) {
+      // System is unhealthy, increment failure count
+      circuitBreakerState.failureCount++;
+      circuitBreakerState.lastFailureTime = now;
+
+      if (
+        circuitBreakerState.failureCount >=
+        HEALTH_CONFIG.CIRCUIT_BREAKER_FAILURE_THRESHOLD
+      ) {
+        // Open the circuit breaker
+        circuitBreakerState.isOpen = true;
+        logError(
+          `🚫 CIRCUIT BREAKER OPENED: System unhealthy (${circuitBreakerState.failureCount} failures)`
+        );
+        logWarning(
+          '🛑 All new process requests will be rejected until system recovers'
+        );
+      }
+    } else if (isHealthy && circuitBreakerState.isOpen) {
+      // System is healthy, check if we should try to close the circuit
+      const timeSinceLastFailure = now - circuitBreakerState.lastFailureTime;
+      const timeSinceLastAttempt = now - circuitBreakerState.lastAttemptTime;
+
+      if (
+        timeSinceLastFailure > HEALTH_CONFIG.CIRCUIT_BREAKER_RECOVERY_TIMEOUT &&
+        timeSinceLastAttempt > HEALTH_CONFIG.CIRCUIT_BREAKER_RECOVERY_TIMEOUT
+      ) {
+        // Try to close the circuit breaker
+        circuitBreakerState.lastAttemptTime = now;
+        circuitBreakerState.failureCount = Math.max(
+          0,
+          circuitBreakerState.failureCount - 1
+        );
+
+        if (circuitBreakerState.failureCount === 0) {
+          circuitBreakerState.isOpen = false;
+          logSuccess('✅ CIRCUIT BREAKER CLOSED: System recovered');
+        } else {
+          logInfo(
+            `🔄 Circuit breaker recovery attempt (${circuitBreakerState.failureCount} failures remaining)`
+          );
+        }
+      }
+    } else if (isHealthy && circuitBreakerState.failureCount > 0) {
+      // System is healthy, gradually reduce failure count
+      circuitBreakerState.failureCount = Math.max(
+        0,
+        circuitBreakerState.failureCount - 1
+      );
+    }
+
+    // Log health status periodically or on significant changes
+    const shouldLog =
+      now - systemHealth.lastHealthCheck >
+        HEALTH_CONFIG.HEALTH_CHECK_INTERVAL ||
+      circuitBreakerState.isOpen ||
+      systemHealth.memoryUsage > HEALTH_CONFIG.MAX_MEMORY_USAGE ||
+      systemHealth.cpuUsage > HEALTH_CONFIG.MAX_CPU_USAGE;
+
+    if (shouldLog) {
+      logHealthStatus();
+    }
+  } catch (error) {
+    logError(`Health check failed: ${error.message}`);
+  }
+}
+
+/**
+ * Check if the system is healthy
+ */
+function checkSystemHealth() {
+  // Check memory usage
+  if (systemHealth.memoryUsage > HEALTH_CONFIG.MAX_MEMORY_USAGE) {
+    return false;
+  }
+
+  // Check CPU usage (rough estimate)
+  if (systemHealth.cpuUsage > HEALTH_CONFIG.MAX_CPU_USAGE) {
+    return false;
+  }
+
+  // Check if we have too many processes running
+  if (activeProcesses.size > PROCESS_CONFIG.MAX_CONCURRENT_PROCESSES * 1.5) {
+    return false;
+  }
+
+  // Check recent error rate (last 5 minutes)
+  const recentErrors = systemHealth.recentErrors.filter(
+    (error) => Date.now() - error.timestamp < 300000
+  ).length;
+
+  if (recentErrors > 10) {
+    // More than 10 errors in 5 minutes
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Log current health status
+ */
+function logHealthStatus() {
+  const status = circuitBreakerState.isOpen ? '🚫 CIRCUIT OPEN' : '✅ HEALTHY';
+  const memPercent = Math.round(systemHealth.memoryUsage * 100);
+  const cpuPercent = Math.round(systemHealth.cpuUsage * 100);
+
+  let message = `🏥 Health: ${status} | Mem: ${memPercent}% | CPU: ${cpuPercent}% | Active: ${systemHealth.activeProcesses} | Queued: ${systemHealth.queuedProcesses}`;
+
+  if (circuitBreakerState.isOpen) {
+    logError(message);
+  } else if (
+    systemHealth.memoryUsage > HEALTH_CONFIG.MAX_MEMORY_USAGE ||
+    systemHealth.cpuUsage > HEALTH_CONFIG.MAX_CPU_USAGE
+  ) {
+    logWarning(message);
+  } else {
+    logInfo(message);
+  }
+}
+
+/**
+ * Record an error for health monitoring
+ */
+function recordError(error) {
+  systemHealth.recentErrors.push({
+    timestamp: Date.now(),
+    message: error.message,
+    type: error.name || 'UnknownError',
+  });
+
+  // Keep only recent errors (last hour)
+  systemHealth.recentErrors = systemHealth.recentErrors.filter(
+    (err) => Date.now() - err.timestamp < 3600000
+  );
+}
+
+/**
+ * Check if circuit breaker allows new requests
+ */
+function canAcceptNewRequests() {
+  return !circuitBreakerState.isOpen;
+}
+
+/**
+ * Record process start metrics
+ */
+function recordProcessStart(agentType, command, storyPath) {
+  systemMetrics.totalProcessesStarted++;
+  systemMetrics.peakConcurrentProcesses = Math.max(
+    systemMetrics.peakConcurrentProcesses,
+    activeProcesses.size
+  );
+
+  // Update agent type metrics
+  if (!systemMetrics.agentTypeMetrics.has(agentType)) {
+    systemMetrics.agentTypeMetrics.set(agentType, {
+      started: 0,
+      completed: 0,
+      failed: 0,
+      totalDuration: 0,
+      avgDuration: 0,
+    });
+  }
+  const agentMetrics = systemMetrics.agentTypeMetrics.get(agentType);
+  agentMetrics.started++;
+
+  // Update command metrics
+  const commandKey = command.substring(0, 50); // Truncate for grouping
+  if (!systemMetrics.commandMetrics.has(commandKey)) {
+    systemMetrics.commandMetrics.set(commandKey, {
+      count: 0,
+      totalDuration: 0,
+      avgDuration: 0,
+    });
+  }
+  systemMetrics.commandMetrics.get(commandKey).count++;
+}
+
+/**
+ * Record process completion metrics
+ */
+function recordProcessCompletion(agentType, duration, success = true) {
+  if (success) {
+    systemMetrics.totalProcessesCompleted++;
+  } else {
+    systemMetrics.totalProcessesFailed++;
+  }
+
+  // Update agent type metrics
+  if (systemMetrics.agentTypeMetrics.has(agentType)) {
+    const agentMetrics = systemMetrics.agentTypeMetrics.get(agentType);
+    if (success) {
+      agentMetrics.completed++;
+    } else {
+      agentMetrics.failed++;
+    }
+    agentMetrics.totalDuration += duration;
+    agentMetrics.avgDuration =
+      agentMetrics.totalDuration /
+      (agentMetrics.completed + agentMetrics.failed);
+  }
+
+  // Update overall average duration
+  const totalCompleted =
+    systemMetrics.totalProcessesCompleted + systemMetrics.totalProcessesFailed;
+  systemMetrics.averageProcessDuration =
+    (systemMetrics.averageProcessDuration * (totalCompleted - 1) + duration) /
+    totalCompleted;
+}
+
+/**
+ * Record queue metrics
+ */
+function recordQueueTime(queueTime) {
+  systemMetrics.totalQueuedTime += queueTime;
+}
+
+/**
+ * Record retry metrics
+ */
+function recordRetry() {
+  systemMetrics.totalRetries++;
+}
+
+/**
+ * Get comprehensive system metrics
+ */
+function getSystemMetrics() {
+  const uptime = Date.now() - systemMetrics.startTime;
+  const avgQueueTime =
+    systemMetrics.totalProcessesStarted > 0
+      ? systemMetrics.totalQueuedTime / systemMetrics.totalProcessesStarted
+      : 0;
+
+  return {
+    uptime,
+    totalStarted: systemMetrics.totalProcessesStarted,
+    totalCompleted: systemMetrics.totalProcessesCompleted,
+    totalFailed: systemMetrics.totalProcessesFailed,
+    totalRetries: systemMetrics.totalRetries,
+    successRate:
+      systemMetrics.totalProcessesStarted > 0
+        ? (
+            (systemMetrics.totalProcessesCompleted /
+              systemMetrics.totalProcessesStarted) *
+            100
+          ).toFixed(1)
+        : 0,
+    avgProcessDuration: Math.round(systemMetrics.averageProcessDuration / 1000), // seconds
+    avgQueueTime: Math.round(avgQueueTime / 1000), // seconds
+    peakConcurrent: systemMetrics.peakConcurrentProcesses,
+    currentActive: activeProcesses.size,
+    currentQueued: processQueue.length,
+    agentTypeBreakdown: Array.from(
+      systemMetrics.agentTypeMetrics.entries()
+    ).map(([type, metrics]) => ({
+      type,
+      started: metrics.started,
+      completed: metrics.completed,
+      failed: metrics.failed,
+      successRate:
+        metrics.started > 0
+          ? ((metrics.completed / metrics.started) * 100).toFixed(1)
+          : 0,
+      avgDuration: Math.round(metrics.avgDuration / 1000),
+    })),
+  };
+}
+
+/**
+ * Log comprehensive metrics report
+ */
+function logMetricsReport() {
+  const metrics = getSystemMetrics();
+
+  console.log(`\n${'='.repeat(100)}`);
+  console.log('📊 SYSTEM METRICS REPORT');
+  console.log(`${'='.repeat(100)}`);
+
+  console.log(`⏱️  Uptime: ${Math.round(metrics.uptime / 60000)} minutes`);
+  console.log(`🚀 Processes Started: ${metrics.totalStarted}`);
+  console.log(`✅ Completed: ${metrics.totalCompleted}`);
+  console.log(`❌ Failed: ${metrics.totalFailed}`);
+  console.log(`🔄 Retries: ${metrics.totalRetries}`);
+  console.log(`📈 Success Rate: ${metrics.successRate}%`);
+  console.log(`⏱️  Avg Process Duration: ${metrics.avgProcessDuration}s`);
+  console.log(`⏳ Avg Queue Time: ${metrics.avgQueueTime}s`);
+  console.log(`🔺 Peak Concurrent: ${metrics.peakConcurrent}`);
+  console.log(`🔄 Currently Active: ${metrics.currentActive}`);
+  console.log(`📋 Currently Queued: ${metrics.currentQueued}`);
+
+  console.log(`\n👥 AGENT TYPE BREAKDOWN:`);
+  metrics.agentTypeBreakdown.forEach((agent) => {
+    console.log(
+      `  ${agent.type}: ${agent.started} started, ${agent.successRate}% success, ${agent.avgDuration}s avg`
+    );
+  });
+
+  console.log(`${'='.repeat(100)}\n`);
+}
+
+/**
+ * Check if we can start a new process
+ */
+function canStartProcess(agentType) {
+  // Check circuit breaker first
+  if (!canAcceptNewRequests()) {
+    return false;
+  }
+
+  // Check total concurrent processes
+  if (activeProcesses.size >= PROCESS_CONFIG.MAX_CONCURRENT_PROCESSES) {
+    return false;
+  }
+
+  // Check processes per agent type
+  const agentTypeCount = Array.from(activeProcesses.values()).filter(
+    (info) => info.agentType === agentType
+  ).length;
+
+  if (agentTypeCount >= PROCESS_CONFIG.MAX_PROCESSES_PER_AGENT_TYPE) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Get current process counts for monitoring
+ */
+function getProcessStats() {
+  const total = activeProcesses.size;
+  const byType = {};
+
+  for (const info of activeProcesses.values()) {
+    byType[info.agentType] = (byType[info.agentType] || 0) + 1;
+  }
+
+  return { total, byType, queued: processQueue.length };
+}
+
+/**
+ * Add process to queue for later execution
+ */
+function queueProcess(
+  agentType,
+  command,
+  storyPath,
+  options = {},
+  resolve,
+  reject
+) {
+  const queueItem = {
+    id: `${agentType}-${Date.now()}-${Math.random()}`,
+    agentType,
+    command,
+    storyPath,
+    options,
+    resolve,
+    reject,
+    queuedAt: Date.now(),
+    attemptCount: 0,
+  };
+
+  processQueue.push(queueItem);
+  logInfo(
+    `📋 Queued ${agentType} process for ${path.basename(storyPath)} (${processQueue.length} in queue)`
+  );
+}
+
+/**
+ * Process queue handler - check for available slots and start queued processes
+ */
+function processQueueHandler() {
+  // Clean expired queue items first
+  const now = Date.now();
+  processQueue = processQueue.filter((item) => {
+    if (now - item.queuedAt > PROCESS_CONFIG.QUEUE_TIMEOUT) {
+      logWarning(
+        `⏰ Queue item expired: ${item.agentType} for ${path.basename(item.storyPath)}`
+      );
+      item.reject(new Error('Process queued too long and expired'));
+      return false;
+    }
+    return true;
+  });
+
+  // Process queue items
+  const queueCopy = [...processQueue];
+  processQueue = [];
+
+  for (const item of queueCopy) {
+    if (canStartProcess(item.agentType)) {
+      logInfo(
+        `🚀 Starting queued ${item.agentType} process for ${path.basename(item.storyPath)}`
+      );
+      item.attemptCount++;
+
+      // Record queue time
+      const queueTime = Date.now() - item.queuedAt;
+      recordQueueTime(queueTime);
+
+      // Execute the queued process
+      executeQueuedProcess(item).catch((error) => {
+        logError(`Failed to execute queued process: ${error.message}`);
+        // Re-queue if it failed and hasn't been attempted too many times
+        if (item.attemptCount < 3) {
+          processQueue.push(item);
+        } else {
+          item.reject(error);
+        }
+      });
+    } else {
+      // Put back in queue
+      processQueue.push(item);
+    }
+  }
+
+  // Log stats if queue is not empty
+  if (processQueue.length > 0) {
+    const stats = getProcessStats();
+    logInfo(
+      `📊 Process stats - Active: ${stats.total}, Queued: ${stats.queued}`
+    );
+  }
+}
+
+/**
+ * Execute a queued process
+ */
+async function executeQueuedProcess(queueItem) {
+  try {
+    const result = await runBMADAgentImmediate(
+      queueItem.agentType,
+      queueItem.command,
+      queueItem.storyPath,
+      queueItem.options
+    );
+    queueItem.resolve(result);
+  } catch (error) {
+    queueItem.reject(error);
+  }
+}
+
+/**
+ * Execute BMAD agent using cursor-agent CLI with adaptive timeouts, improved error handling, and retry logic
  */
 function runBMADAgent(agentType, command, storyPath, options = {}) {
+  const maxRetries = options.maxRetries || 2;
+  let retryCount = 0;
+
+  const attemptExecution = () => {
+    return new Promise((resolve, reject) => {
+      if (canStartProcess(agentType)) {
+        // Can start immediately
+        runBMADAgentImmediate(agentType, command, storyPath, options)
+          .then(resolve)
+          .catch((error) => {
+            // Check if error is retryable
+            if (shouldRetryError(error, retryCount, maxRetries)) {
+              retryCount++;
+              recordRetry();
+              logWarning(
+                `🔄 Retrying ${agentType} (attempt ${retryCount}/${maxRetries}): ${error.message}`
+              );
+              setTimeout(attemptExecution, 2000 * retryCount); // Exponential backoff
+            } else {
+              reject(error);
+            }
+          });
+      } else {
+        // Queue for later execution
+        queueProcess(agentType, command, storyPath, options, resolve, reject);
+      }
+    });
+  };
+
+  return attemptExecution();
+}
+
+/**
+ * Determine if an error should trigger a retry
+ */
+function shouldRetryError(error, retryCount, maxRetries) {
+  if (retryCount >= maxRetries) return false;
+
+  const errorMessage = error.message.toLowerCase();
+
+  // Retry on these error patterns
+  const retryablePatterns = [
+    'exit code: null', // Process killed/crashed
+    'timeout', // Timeout errors
+    'enotfound', // Network issues
+    'econnrefused', // Connection refused
+    'spawn error', // Process spawn failures
+  ];
+
+  // Don't retry on permanent errors
+  const nonRetryablePatterns = [
+    'file too large', // Size limits
+    'permission denied', // File permissions
+    'no such file', // Missing files
+    'invalid argument', // Bad arguments
+  ];
+
+  const isRetryable = retryablePatterns.some((pattern) =>
+    errorMessage.includes(pattern)
+  );
+  const isNonRetryable = nonRetryablePatterns.some((pattern) =>
+    errorMessage.includes(pattern)
+  );
+
+  return isRetryable && !isNonRetryable;
+}
+
+/**
+ * Execute BMAD agent immediately (internal function)
+ */
+function runBMADAgentImmediate(agentType, command, storyPath, options = {}) {
   // Use BMAD agent file paths as references
   const agentRoles = {
     analyst: '@/.cursor/rules/bmad/analyst.mdc',
@@ -372,33 +1107,91 @@ function runBMADAgent(agentType, command, storyPath, options = {}) {
   );
   console.log(`${'='.repeat(80)}\n`);
 
+  // Adaptive timeout based on agent type, story complexity, and system load
+  const baseTimeouts = {
+    analyst: 900000, // 15 minutes base for analysis
+    pm: 600000, // 10 minutes base for review
+    sm: 450000, // 7.5 minutes base for splitting
+    architect: 1200000, // 20 minutes base for design
+    dev: 1800000, // 30 minutes base for development
+    qa: 900000, // 15 minutes base for testing
+  };
+
+  // Calculate adaptive timeout based on story size and complexity
+  let adaptiveTimeout = baseTimeouts[agentType] || 600000;
+
+  try {
+    const fileInfo = checkFileSize(storyPath);
+    const lines = fileInfo.lines;
+    const sizeKB = fileInfo.sizeKB;
+
+    // Increase timeout for large stories
+    if (lines > 5000) {
+      const sizeMultiplier = Math.min(2.0, 1 + (lines - 5000) / 10000); // Max 2x
+      adaptiveTimeout = Math.round(adaptiveTimeout * sizeMultiplier);
+    }
+
+    // Increase timeout if system is under load
+    const loadMultiplier = Math.min(1.5, 1 + activeProcesses.size * 0.1); // Max 1.5x
+    adaptiveTimeout = Math.round(adaptiveTimeout * loadMultiplier);
+
+    // Log timeout calculation for large stories
+    if (lines > 3000 || adaptiveTimeout > baseTimeouts[agentType] * 1.2) {
+      logInfo(
+        `⏰ Adaptive timeout: ${Math.round(adaptiveTimeout / 60000)}min for ${agentType} (${lines} lines, ${sizeKB}KB)`
+      );
+    }
+  } catch (error) {
+    // Fall back to base timeout if file check fails
+    logWarning(`Could not calculate adaptive timeout: ${error.message}`);
+  }
+
+  const timeout = options.timeout || adaptiveTimeout;
+
   // Use spawn for better process control and cancellation
   const { spawn } = require('child_process');
-  const timeout = options.allowCode ? 1800000 : 600000;
+
+  // Record process start metrics
+  recordProcessStart(agentType, command, storyPath);
 
   return new Promise((resolve, reject) => {
-    // Create the agent process - NO detached mode for proper cleanup
+    // Create the agent process with proper environment isolation
     const agentProcess = spawn(
       'cursor-agent',
       ['agent', '--model', AI_MODEL, '--print', '--output-format', 'text'],
       {
         stdio: ['pipe', 'pipe', 'pipe'],
         cwd: process.cwd(),
-        // REMOVED: detached: true - this prevents proper process killing
+        env: {
+          ...process.env,
+          BMAD_AGENT_TYPE: agentType,
+          BMAD_INSTANCE_ID: process.env.BMAD_INSTANCE_ID || 'default',
+          BMAD_PARENT_PID: process.pid.toString(),
+        },
       }
     );
 
     // Track the process for cleanup
-    activeChildProcesses.set(agentType, agentProcess);
+    activeProcesses.set(agentProcess.pid, {
+      agentType,
+      pid: agentProcess.pid,
+      startTime: Date.now(),
+      storyPath,
+      command: command.substring(0, 100) + '...',
+    });
 
     let stdout = '';
     let stderr = '';
     let timeoutId;
+    let heartbeatId;
     let isCompleted = false;
+    let startTime = Date.now();
 
     // Handle stdout
     agentProcess.stdout.on('data', (data) => {
       stdout += data.toString();
+      // Update heartbeat on activity
+      updateLockHeartbeat(getAgentLockFile(agentType), 'active');
     });
 
     // Handle stderr
@@ -412,29 +1205,61 @@ function runBMADAgent(agentType, command, storyPath, options = {}) {
         clearTimeout(timeoutId);
         timeoutId = null;
       }
-      activeChildProcesses.delete(agentType);
+      if (heartbeatId) {
+        clearInterval(heartbeatId);
+        heartbeatId = null;
+      }
+      activeProcesses.delete(agentProcess.pid);
       isCompleted = true;
+
+      // Clean up any locks held by this process
+      try {
+        const lockFile = getAgentLockFile(agentType);
+        if (fs.existsSync(lockFile)) {
+          fs.unlinkSync(lockFile);
+          logInfo(`🔓 Released lock for ${agentType} process`);
+        }
+      } catch (error) {
+        logWarning(`Could not cleanup lock for ${agentType}: ${error.message}`);
+      }
     };
+
+    // Start heartbeat for long-running processes
+    if (timeout > 300000) {
+      // For processes longer than 5 minutes
+      heartbeatId = setInterval(() => {
+        updateLockHeartbeat(getAgentLockFile(agentType), 'running');
+      }, 30000); // Update every 30 seconds
+    }
 
     // Handle process completion
     agentProcess.on('close', (code) => {
       if (isCompleted) return; // Already handled
       cleanupProcess();
 
+      const duration = Date.now() - startTime;
       console.log(`\n${'='.repeat(80)}`);
       if (code === 0) {
-        console.log(`✅ AGENT COMPLETED: ${role} (${agentType})`);
+        console.log(
+          `✅ AGENT COMPLETED: ${role} (${agentType}) in ${Math.round(duration / 1000)}s`
+        );
         console.log(`${'='.repeat(80)}\n`);
+        recordProcessCompletion(agentType, duration, true);
         resolve(stdout.trim());
       } else {
         console.log(
-          `❌ AGENT FAILED: ${role} (${agentType}) - Exit code: ${code}`
+          `❌ AGENT FAILED: ${role} (${agentType}) - Exit code: ${code} (${Math.round(duration / 1000)}s)`
         );
         if (stderr) {
           console.log(`STDERR: ${stderr}`);
         }
         console.log(`${'='.repeat(80)}\n`);
-        reject(new Error(`Agent process exited with code ${code}: ${stderr}`));
+        const error = new Error(
+          `Agent process exited with code ${code}: ${stderr}`
+        );
+        recordError(error);
+        recordProcessCompletion(agentType, duration, false);
+        reject(error);
       }
     });
 
@@ -443,9 +1268,14 @@ function runBMADAgent(agentType, command, storyPath, options = {}) {
       if (isCompleted) return; // Already handled
       cleanupProcess();
 
+      const duration = Date.now() - startTime;
       console.log(`\n${'='.repeat(80)}`);
-      console.log(`❌ AGENT ERROR: ${role} (${agentType}) - ${error.message}`);
+      console.log(
+        `❌ AGENT ERROR: ${role} (${agentType}) - ${error.message} (${Math.round(duration / 1000)}s)`
+      );
       console.log(`${'='.repeat(80)}\n`);
+      recordError(error);
+      recordProcessCompletion(agentType, duration, false);
       reject(error);
     });
 
@@ -453,7 +1283,9 @@ function runBMADAgent(agentType, command, storyPath, options = {}) {
     agentProcess.stdin.write(fullPrompt);
     agentProcess.stdin.end();
 
-    // Set timeout with proper cleanup
+    // Set adaptive timeout with warning phases
+    const warningTime = Math.max(timeout * 0.8, timeout - 120000); // Warning at 80% or 2min before timeout
+
     timeoutId = setTimeout(() => {
       if (isCompleted) return; // Already handled
 
@@ -463,26 +1295,21 @@ function runBMADAgent(agentType, command, storyPath, options = {}) {
       );
       console.log(`${'='.repeat(80)}\n`);
 
-      // Kill the process with graceful shutdown
-      const killProcess = () => {
+      // Graceful shutdown with escalation
+      const killProcess = async () => {
         try {
           if (!agentProcess.killed) {
+            // Phase 1: SIGTERM with 10 second grace period
             agentProcess.kill('SIGTERM');
-            // Give it 3 seconds to terminate gracefully, then force kill
-            setTimeout(() => {
-              try {
-                if (!agentProcess.killed) {
-                  console.log(
-                    `🔪 Force-killing ${agentType} agent (PID: ${agentProcess.pid})`
-                  );
-                  agentProcess.kill('SIGKILL');
-                }
-              } catch (forceKillError) {
-                console.error(
-                  `❌ Failed to force-kill process: ${forceKillError.message}`
-                );
-              }
-            }, 3000);
+
+            await new Promise((resolve) => setTimeout(resolve, 10000));
+
+            if (!agentProcess.killed) {
+              console.log(
+                `🔪 Force-killing ${agentType} agent (PID: ${agentProcess.pid})`
+              );
+              agentProcess.kill('SIGKILL');
+            }
           }
         } catch (killError) {
           console.error(
@@ -492,10 +1319,31 @@ function runBMADAgent(agentType, command, storyPath, options = {}) {
       };
 
       cleanupProcess();
-      killProcess();
-      reject(new Error(`Agent timeout after ${timeout}ms`));
+      killProcess().then(() => {
+        const duration = Date.now() - startTime;
+        const error = new Error(`Agent timeout after ${timeout}ms`);
+        recordError(error);
+        recordProcessCompletion(agentType, duration, false);
+        reject(error);
+      });
     }, timeout);
+
+    // Warning timeout
+    setTimeout(() => {
+      if (!isCompleted) {
+        console.log(
+          `\n⚠️  ${role} (${agentType}) approaching timeout (${Math.round((Date.now() - startTime) / 1000)}s elapsed)`
+        );
+      }
+    }, warningTime);
   });
+}
+
+/**
+ * Get agent-specific lock file path
+ */
+function getAgentLockFile(agentType) {
+  return path.join(LOCKS_DIR, `agent-${agentType}.lock`);
 }
 
 /**
@@ -647,14 +1495,27 @@ function savePriorityOrder(priorityData) {
 }
 
 /**
- * Validate file size to prevent processing extremely large files
+ * Check file size and provide warnings (no longer throws errors)
  */
-function validateFileSize(filePath, maxLines = 10000) {
-  const content = fs.readFileSync(filePath, 'utf8');
-  const lines = content.split('\n').length;
+function checkFileSize(filePath, maxLines = 50000) {
+  try {
+    const stats = fs.statSync(filePath);
+    const content = fs.readFileSync(filePath, 'utf8');
+    const lines = content.split('\n').length;
+    const sizeKB = Math.round(stats.size / 1024);
 
-  if (lines > maxLines) {
-    throw new Error(`File too large: ${lines} lines (max: ${maxLines})`);
+    if (lines > maxLines) {
+      logWarning(
+        `📄 Large story detected: ${lines} lines (${sizeKB}KB) - processing may be slow`
+      );
+    } else if (lines > 10000) {
+      logInfo(`📄 Story size: ${lines} lines (${sizeKB}KB)`);
+    }
+
+    return { lines, sizeKB, isLarge: lines > maxLines };
+  } catch (error) {
+    logWarning(`Could not check file size for ${filePath}: ${error.message}`);
+    return { lines: 0, sizeKB: 0, isLarge: false };
   }
 }
 
@@ -840,6 +1701,7 @@ function validateTerminal() {
 async function runBot() {
   validateTerminal();
   validateSetup();
+  initializeProcessManagement();
 
   const priority = loadPriorityOrder();
   const state = await loadWorkflowStateAtomic();
@@ -894,7 +1756,7 @@ async function runBot() {
     }
 
     try {
-      validateFileSize(story.path);
+      checkFileSize(story.path);
 
       let qaPassed = false;
       let cycleCount = 0;
@@ -1016,6 +1878,7 @@ async function runBot() {
 async function runPrioritize() {
   validateTerminal();
   validateSetup();
+  initializeProcessManagement();
 
   // Get ALL stories regardless of state
   const allStories = getStoryFiles();
@@ -1439,6 +2302,7 @@ Create the split stories NOW if splitting is needed.`,
 async function runRefine() {
   validateTerminal();
   validateSetup();
+  initializeProcessManagement();
 
   const state = await loadWorkflowStateAtomic();
   const storyFiles = getStoryFiles();
@@ -1484,7 +2348,7 @@ async function runRefine() {
     }
 
     try {
-      validateFileSize(story.path);
+      checkFileSize(story.path);
 
       // PM always gets the same command for both ANALYZED and IN_REVIEW stories
       logInfo(`👨‍💼 PM reviewing: ${story.filename}`);
@@ -1497,7 +2361,7 @@ async function runRefine() {
       let pmCommand;
       if (storyCurrentState === WORKFLOW_STATES.ANALYZED) {
         // For analyzed stories: review and create review file if needed
-        pmCommand = `review this story and provide feedback on business value and user experience. If you have any business logic doubts or need clarification from the product owner, create a review file with the EXACT filename "${reviewFilePath}" (note: starts with dot, ends with .txt extension) and write your specific questions (only the questions simply) to it (note: first search the big file of previous questions/answers "/REVIEW_ANSWERS.md", and other documentations from this codebase, and ONLY ask human if it is important and not already answered in the documentation!).`;
+        pmCommand = `review this story and provide feedback on business value and user experience. CRITICAL: Only create a review file if you have SPECIFIC business logic questions that are NOT answered in the existing documentation (check /REVIEW_ANSWERS.md and other docs first). If you create a review file, use EXACT filename "${reviewFilePath}" and write only the SPECIFIC unanswered questions (no placeholders, no "waiting for review" text).`;
       } else if (storyCurrentState === WORKFLOW_STATES.AWAITING_HUMAN_INPUT) {
         // For in_review stories: check if human answered sufficiently
         if (fs.existsSync(reviewFilePath)) {
@@ -1658,6 +2522,7 @@ async function runRefine() {
 async function runAnalyze() {
   validateTerminal();
   validateSetup();
+  initializeProcessManagement();
 
   const storyFiles = getStoryFiles();
   const state = await loadWorkflowStateAtomic();
@@ -1741,7 +2606,7 @@ async function runAnalyze() {
     }
 
     try {
-      validateFileSize(story.path);
+      checkFileSize(story.path);
 
       logInfo(`📊 Analyzing: ${story.filename}`);
 
@@ -1763,7 +2628,7 @@ async function runAnalyze() {
       const contentAfter = fs.readFileSync(story.path, 'utf8');
       detectContentLoops(story.path, contentAfter);
 
-      validateFileSize(story.path);
+      checkFileSize(story.path);
 
       updateStoryWorkflowStateAtomic(story.filename, WORKFLOW_STATES.ANALYZED);
       logSuccess(`✅ Analysis complete: ${story.filename}`);
@@ -1826,19 +2691,14 @@ async function validateWorkflowState() {
             logSuccess(`🔧 Unstuck ${storyKey} - moved to REFINED state`);
             stuckStories++;
           } else {
-            // PM hasn't reviewed yet, create a placeholder review file
-            try {
-              fs.writeFileSync(
-                reviewFilePath,
-                'REVIEW: Story review pending\n\nQUESTIONS FOR PRODUCT OWNER CLARIFICATION:\n\n1. Please review the story and provide any business logic clarification needed.\n\n**WAITING FOR PM REVIEW**'
-              );
-              logInfo(`📝 Created missing review file for ${storyKey}`);
-              stuckStories++;
-            } catch (error) {
-              logError(
-                `Could not create review file for ${storyKey}: ${error.message}`
-              );
-            }
+            // No review file exists, but story is in AWAITING_HUMAN_INPUT
+            // This indicates the PM agent determined no human questions were needed
+            // Move back to REFINED state to continue workflow
+            state[storyKey] = WORKFLOW_STATES.REFINED;
+            logSuccess(
+              `🔧 Unstuck ${storyKey} - no review file needed, moved to REFINED state`
+            );
+            stuckStories++;
           }
         }
       }
@@ -1910,6 +2770,10 @@ async function main() {
 
     case 'status':
       await showStatus();
+      break;
+
+    case 'metrics':
+      logMetricsReport();
       break;
 
     case 'prioritize':
@@ -1993,6 +2857,7 @@ COMMANDS:
   prioritize             PM agent creates priority ordering with convergence
   bot                    Process REFINED stories by priority with Architect→Dev→QA cycles
   status                 Show status of all stories and workflow state
+  metrics                Show comprehensive system performance metrics and statistics
   reset <story-name>     Reset a story to READY state (without .md)
   cleanup                Kill ALL cursor-agent processes and orchestrator scripts, then validate state
   validate               Validate and repair workflow state (fixes PM review bugs, unstucks stories)
@@ -2035,7 +2900,7 @@ REVIEW FILE FORMAT:
 }
 
 // Global tracking of all spawned child processes for proper cleanup
-const activeChildProcesses = new Map();
+// Note: activeProcesses is now declared earlier in the file
 
 // Global shutdown flag - set to true when SIGINT/SIGTERM received
 let shutdownRequested = false;
@@ -2161,162 +3026,242 @@ function killAllChildProcesses(signal = 'SIGTERM') {
   }
 }
 
-// Handle process termination signals - only kill our own processes
+// Handle process termination signals - only kill our own processes with graceful shutdown
 process.on('SIGINT', () => {
-  console.log(
-    `\n🚨 CTRL+C DETECTED - shutting down this orchestrator instance`
-  );
-  shutdownRequested = true; // Set global shutdown flag
-
-  console.log(
-    `🛑 Terminating ${activeChildProcesses.size} agent processes spawned by this instance...`
-  );
-
-  // Kill only the tracked processes spawned by this instance
-  for (const [agentType, child] of activeChildProcesses) {
-    try {
-      console.log(`💀 KILLING ${agentType} agent (PID: ${child.pid})`);
-      child.kill('SIGTERM');
-
-      // Give it 1 second to terminate gracefully, then force kill
-      setTimeout(() => {
-        try {
-          if (!child.killed) {
-            console.log(
-              `🔪 Force-killing ${agentType} agent (PID: ${child.pid})`
-            );
-            child.kill('SIGKILL');
-          }
-        } catch (killError) {
-          // Process might already be dead
-        }
-      }, 1000);
-    } catch (error) {
-      console.error(`❌ Failed to kill ${agentType}: ${error.message}`);
-    }
-  }
-
-  activeChildProcesses.clear();
-  console.log(`✅ This orchestrator instance shutdown complete`);
-
-  // Exit with SIGINT code
-  process.exit(130);
+  gracefulShutdown('SIGINT (Ctrl+C)', 130);
 });
 
 process.on('SIGTERM', () => {
-  console.log(
-    `\n🚨 SIGTERM received - shutting down this orchestrator instance`
-  );
-  shutdownRequested = true; // Set global shutdown flag
-
-  console.log(
-    `🛑 Terminating ${activeChildProcesses.size} agent processes spawned by this instance...`
-  );
-
-  // Kill only the tracked processes spawned by this instance
-  for (const [agentType, child] of activeChildProcesses) {
-    try {
-      console.log(`💀 KILLING ${agentType} agent (PID: ${child.pid})`);
-      child.kill('SIGTERM');
-
-      // Give it 1 second to terminate gracefully, then force kill
-      setTimeout(() => {
-        try {
-          if (!child.killed) {
-            console.log(
-              `🔪 Force-killing ${agentType} agent (PID: ${child.pid})`
-            );
-            child.kill('SIGKILL');
-          }
-        } catch (killError) {
-          // Process might already be dead
-        }
-      }, 1000);
-    } catch (error) {
-      console.error(`❌ Failed to kill ${agentType}: ${error.message}`);
-    }
-  }
-
-  activeChildProcesses.clear();
-  console.log(`✅ This orchestrator instance shutdown complete`);
-
-  // Exit cleanly
-  process.exit(0);
+  gracefulShutdown('SIGTERM', 0);
 });
 
-// Display active processes on exit
-process.on('exit', (code) => {
-  if (activeChildProcesses.size > 0) {
+/**
+ * Graceful shutdown with proper cleanup and escalation
+ */
+async function gracefulShutdown(signal, exitCode) {
+  console.log(`\n🚨 ${signal} DETECTED - initiating graceful shutdown`);
+  shutdownRequested = true; // Set global shutdown flag
+
+  const instanceId = process.env.BMAD_INSTANCE_ID || 'default';
+  console.log(
+    `🛑 Terminating ${activeProcesses.size} agent processes for instance ${instanceId}...`
+  );
+
+  if (activeProcesses.size > 0) {
     console.log(
-      `\n⚠️  WARNING: ${activeChildProcesses.size} agent processes may still be running!`
+      `${'🚨'.repeat(10)} COST PROTECTION ACTIVATED ${'🚨'.repeat(10)}`
+    );
+
+    // Phase 1: SIGTERM with grace period
+    const killPromises = [];
+    for (const [pid, processInfo] of activeProcesses) {
+      killPromises.push(
+        killProcessByPidGracefully(processInfo.agentType, pid, 'SIGTERM', 5000)
+      );
+    }
+
+    // Wait for all processes to terminate gracefully
+    await Promise.allSettled(killPromises);
+
+    // Phase 2: Check for stubborn processes and force kill
+    const remainingProcesses = [];
+    for (const [pid, processInfo] of activeProcesses) {
+      try {
+        process.kill(pid, 0); // Check if still running
+        remainingProcesses.push([processInfo.agentType, pid]);
+      } catch (error) {
+        // Process is dead, remove from tracking
+        activeProcesses.delete(pid);
+      }
+    }
+
+    if (remainingProcesses.length > 0) {
+      console.log(
+        `🔪 Force-killing ${remainingProcesses.length} stubborn processes...`
+      );
+      for (const [agentType, pid] of remainingProcesses) {
+        await killProcessByPidGracefully(agentType, pid, 'SIGKILL', 1000);
+      }
+    }
+
+    console.log(
+      `${'💰'.repeat(10)} COST PROTECTION SUCCESSFUL ${'💰'.repeat(10)}`
+    );
+  }
+
+  // Cleanup intervals
+  if (processQueueInterval) {
+    clearInterval(processQueueInterval);
+    processQueueInterval = null;
+  }
+  if (processCleanupInterval) {
+    clearInterval(processCleanupInterval);
+    processCleanupInterval = null;
+  }
+
+  // Cleanup our locks
+  releaseOrchestratorInstanceLock();
+  releaseWorkflowStateLock();
+
+  activeProcesses.clear();
+  console.log(`✅ Instance ${instanceId} shutdown complete`);
+
+  process.exit(exitCode);
+}
+
+/**
+ * Kill a process with proper error handling and timeout
+ */
+async function killProcessGracefully(
+  agentType,
+  childProcess,
+  signal,
+  gracePeriodMs
+) {
+  return new Promise((resolve) => {
+    try {
+      if (childProcess.killed) {
+        resolve();
+        return;
+      }
+
+      console.log(
+        `💀 Sending ${signal} to ${agentType} agent (PID: ${childProcess.pid})`
+      );
+      childProcess.kill(signal);
+
+      // Set timeout for force cleanup
+      const timeoutId = setTimeout(() => {
+        try {
+          if (!childProcess.killed) {
+            console.log(
+              `🔪 Force-killing ${agentType} agent (PID: ${childProcess.pid})`
+            );
+            childProcess.kill('SIGKILL');
+          }
+        } catch (error) {
+          console.error(
+            `❌ Failed to force-kill ${agentType}: ${error.message}`
+          );
+        }
+        resolve();
+      }, gracePeriodMs);
+
+      // Clear timeout when process actually exits
+      childProcess.on('close', () => {
+        clearTimeout(timeoutId);
+        resolve();
+      });
+    } catch (error) {
+      console.error(`❌ Failed to kill ${agentType}: ${error.message}`);
+      resolve();
+    }
+  });
+}
+
+/**
+ * Kill a process by PID with proper error handling and timeout
+ */
+async function killProcessByPidGracefully(
+  agentType,
+  pid,
+  signal,
+  gracePeriodMs
+) {
+  return new Promise((resolve) => {
+    try {
+      console.log(`💀 Sending ${signal} to ${agentType} agent (PID: ${pid})`);
+      process.kill(pid, signal);
+
+      // Set timeout for force cleanup
+      const timeoutId = setTimeout(() => {
+        try {
+          // Check if process is still running before force killing
+          process.kill(pid, 0);
+          console.log(`🔪 Force-killing ${agentType} agent (PID: ${pid})`);
+          process.kill(pid, 'SIGKILL');
+        } catch (error) {
+          // Process is already dead or we can't kill it
+          if (error.code !== 'ESRCH') {
+            console.error(
+              `❌ Failed to force-kill ${agentType}: ${error.message}`
+            );
+          }
+        }
+        resolve();
+      }, gracePeriodMs);
+
+      // Try to wait for process to actually exit (though we can't listen to events for external PIDs)
+      setTimeout(() => {
+        clearTimeout(timeoutId);
+        resolve();
+      }, gracePeriodMs + 1000);
+    } catch (error) {
+      if (error.code === 'ESRCH') {
+        // Process is already dead
+        console.log(
+          `✅ ${agentType} agent (PID: ${pid}) was already terminated`
+        );
+      } else {
+        console.error(
+          `❌ Failed to kill ${agentType} (PID: ${pid}): ${error.message}`
+        );
+      }
+      resolve();
+    }
+  });
+}
+
+process.on('SIGTERM', () => {
+  gracefulShutdown('SIGTERM', 0);
+});
+
+// Cleanup process management on exit
+process.on('exit', (code) => {
+  // Clear intervals
+  if (processQueueInterval) {
+    clearInterval(processQueueInterval);
+    processQueueInterval = null;
+  }
+  if (processCleanupInterval) {
+    clearInterval(processCleanupInterval);
+    processCleanupInterval = null;
+  }
+  if (healthMonitorInterval) {
+    clearInterval(healthMonitorInterval);
+    healthMonitorInterval = null;
+  }
+
+  // Check for orphaned processes
+  if (activeProcesses.size > 0) {
+    console.log(
+      `\n⚠️  WARNING: ${activeProcesses.size} agent processes may still be running!`
     );
     console.log(
       `This should not happen - please check for orphaned processes.`
+    );
+    console.log('Active processes:');
+    for (const [pid, info] of activeProcesses.entries()) {
+      console.log(`  - ${info.agentType} (PID: ${pid})`);
+    }
+  }
+
+  if (processQueue.length > 0) {
+    console.log(
+      `\n⚠️  WARNING: ${processQueue.length} processes still in queue!`
     );
   }
 });
 
 // Handle uncaught errors gracefully
-process.on('uncaughtException', (error) => {
+process.on('uncaughtException', async (error) => {
   logError(`💥 Uncaught exception: ${error.message}`);
-
-  // Kill only our own processes, not system-wide
-  console.log(
-    `🛑 Terminating ${activeChildProcesses.size} agent processes spawned by this instance...`
-  );
-  for (const [agentType, child] of activeChildProcesses) {
-    try {
-      console.log(`💀 KILLING ${agentType} agent (PID: ${child.pid})`);
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        try {
-          if (!child.killed) {
-            console.log(
-              `🔪 Force-killing ${agentType} agent (PID: ${child.pid})`
-            );
-            child.kill('SIGKILL');
-          }
-        } catch (killError) {
-          // Process might already be dead
-        }
-      }, 1000);
-    } catch (error) {
-      console.error(`❌ Failed to kill ${agentType}: ${error.message}`);
-    }
-  }
-  activeChildProcesses.clear();
-  process.exit(1);
+  await gracefulShutdown('uncaughtException', 1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', async (reason, promise) => {
   logError(`💥 Unhandled promise rejection: ${reason}`);
-
-  // Kill only our own processes, not system-wide
-  console.log(
-    `🛑 Terminating ${activeChildProcesses.size} agent processes spawned by this instance...`
-  );
-  for (const [agentType, child] of activeChildProcesses) {
-    try {
-      console.log(`💀 KILLING ${agentType} agent (PID: ${child.pid})`);
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        try {
-          if (!child.killed) {
-            console.log(
-              `🔪 Force-killing ${agentType} agent (PID: ${child.pid})`
-            );
-            child.kill('SIGKILL');
-          }
-        } catch (killError) {
-          // Process might already be dead
-        }
-      }, 1000);
-    } catch (error) {
-      console.error(`❌ Failed to kill ${agentType}: ${error.message}`);
-    }
-  }
-  activeChildProcesses.clear();
-  process.exit(1);
+  await gracefulShutdown('unhandledRejection', 1);
 });
 
 // Run the orchestrator
