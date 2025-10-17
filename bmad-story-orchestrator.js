@@ -21,8 +21,8 @@ const WORKFLOW_STATE_FILE = path.join(STORIES_DIR, '.workflow-state.json');
 
 // Process management and queuing system
 const PROCESS_CONFIG = {
-  MAX_CONCURRENT_PROCESSES: 3, // Maximum concurrent cursor-agent processes
-  MAX_PROCESSES_PER_AGENT_TYPE: 2, // Max processes per agent type
+  MAX_CONCURRENT_PROCESSES: 15, // Maximum concurrent cursor-agent processes
+  MAX_PROCESSES_PER_AGENT_TYPE: 10, // Max processes per agent type
   PROCESS_QUEUE_CHECK_INTERVAL: 5000, // Check queue every 5 seconds
   PROCESS_CLEANUP_INTERVAL: 30000, // Cleanup dead processes every 30 seconds
   MAX_PROCESS_AGE: 3600000, // Kill processes older than 1 hour
@@ -34,8 +34,8 @@ const HEALTH_CONFIG = {
   HEALTH_CHECK_INTERVAL: 60000, // Check health every minute
   CIRCUIT_BREAKER_FAILURE_THRESHOLD: 5, // Open circuit after 5 failures
   CIRCUIT_BREAKER_RECOVERY_TIMEOUT: 300000, // Try to close circuit after 5 minutes
-  MAX_MEMORY_USAGE: 0.8, // Alert if memory usage > 80%
-  MAX_CPU_USAGE: 0.9, // Alert if CPU usage > 90%
+  MAX_MEMORY_USAGE: 0.9, // Alert if memory usage > 90%
+  MAX_CPU_USAGE: 0.99, // Alert if CPU usage > 99%
 };
 
 // Allow multiple concurrent instances - no global lock file
