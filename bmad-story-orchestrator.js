@@ -21,8 +21,8 @@ const WORKFLOW_STATE_FILE = path.join(STORIES_DIR, '.workflow-state.json');
 
 // Process management and queuing system
 const PROCESS_CONFIG = {
-  MAX_CONCURRENT_PROCESSES: 15, // Maximum concurrent cursor-agent processes
-  MAX_PROCESSES_PER_AGENT_TYPE: 10, // Max processes per agent type
+  MAX_CONCURRENT_PROCESSES: 20, // Maximum concurrent cursor-agent processes
+  MAX_PROCESSES_PER_AGENT_TYPE: 20, // Max processes per agent type
   PROCESS_QUEUE_CHECK_INTERVAL: 5000, // Check queue every 5 seconds
   PROCESS_CLEANUP_INTERVAL: 30000, // Cleanup dead processes every 30 seconds
   MAX_PROCESS_AGE: 3600000, // Kill processes older than 1 hour
@@ -34,7 +34,7 @@ const HEALTH_CONFIG = {
   HEALTH_CHECK_INTERVAL: 60000, // Check health every minute
   CIRCUIT_BREAKER_FAILURE_THRESHOLD: 5, // Open circuit after 5 failures
   CIRCUIT_BREAKER_RECOVERY_TIMEOUT: 300000, // Try to close circuit after 5 minutes
-  MAX_MEMORY_USAGE: 0.9, // Alert if memory usage > 90%
+  MAX_MEMORY_USAGE: 0.99, // Alert if memory usage > 99%
   MAX_CPU_USAGE: 0.99, // Alert if CPU usage > 99%
 };
 
@@ -1762,50 +1762,73 @@ async function runBot() {
       let cycleCount = 0;
       const maxCycles = 5;
 
-      // Architect runs once to design the solution
-      logInfo(`🏗️ Architect designing solution for: ${story.filename}`);
-      await runBMADAgent(
-        'architect',
-        'design solution architecture and write detailed implementation plan to the story file',
-        story.path,
-        { allowCode: false } // Documentation only
-      );
-      const contentAfterArchitect = fs.readFileSync(story.path, 'utf8');
-      detectContentLoops(story.path, contentAfterArchitect);
+      // Check if story already has a PASS gate before running cycles
+      const qaDir = path.join(__dirname, '..', 'docs', 'qa');
+      const storyKey = story.filename.replace(/\.md$/, '');
+      const parts = storyKey.split('.');
+      const firstPart = parts[0] + '.' + parts[1];
+      const restPart = parts
+        .slice(2)
+        .join('.')
+        .toLowerCase()
+        .replace(/\./g, '-');
+      const gateSlug = firstPart + '-' + restPart;
+      const gateFilePath = path.join(qaDir, 'gates', `${gateSlug}.yml`);
 
-      // Dev→QA cycles until implementation is 100% complete
+      if (fs.existsSync(gateFilePath)) {
+        try {
+          const gateContent = fs.readFileSync(gateFilePath, 'utf8');
+          if (gateContent.includes('gate: PASS')) {
+            qaPassed = true;
+            logSuccess(
+              `✅ Found existing PASS gate for ${story.filename} - skipping cycles`
+            );
+          }
+        } catch (error) {
+          // Ignore file read errors, proceed with cycles
+        }
+      }
+
+      // Dev→QA cycles until implementation is 100% complete (only if not already passed)
       while (!qaPassed && cycleCount < maxCycles) {
         cycleCount++;
         logInfo(`🔄 Implementation cycle ${cycleCount} for: ${story.filename}`);
 
         // Dev - develop and summarize changes
         const storyKey = story.filename.replace(/\.md$/, '');
-        await runBMADAgent(
-          'dev',
-          `develop-story ${storyKey} and summarize all changes made to the story file so QA can review what was implemented`,
-          story.path,
-          {
-            allowCode: true,
-          }
-        ); // CODE ALLOWED
+        setCurrentOperation('dev', story.path);
+        try {
+          await runBMADAgent(
+            'dev',
+            `develop-story ${storyKey} and summarize all changes made to the story file so QA can review what was implemented`,
+            story.path,
+            {
+              allowCode: true,
+            }
+          ); // CODE ALLOWED
+        } finally {
+          clearCurrentOperation();
+        }
         const contentAfterDev = fs.readFileSync(story.path, 'utf8');
         detectContentLoops(story.path, contentAfterDev);
 
         // QA - comprehensive review using full BMAD review-story task
-        const qaResult = await runBMADAgent(
-          'qa',
-          `review ${storyKey}`,
-          story.path,
-          {
-            allowCode: true, // Allow QA to refactor code if appropriate
-          }
-        );
+        setCurrentOperation('qa', story.path);
+        let qaResult;
+        try {
+          qaResult = await runBMADAgent(
+            'qa',
+            `*review ${storyKey}`,
+            story.path,
+            {
+              allowCode: true, // Allow QA to refactor code if appropriate
+            }
+          );
+        } finally {
+          clearCurrentOperation();
+        }
 
         // Check gate file for final decision (text-based analysis)
-        const qaDir = path.join(__dirname, '..', 'qa');
-        const gateFilePath = path.join(qaDir, 'gates', `${storyKey}.yml`);
-
-        let qaPassed = false;
         if (fs.existsSync(gateFilePath)) {
           try {
             const gateContent = fs.readFileSync(gateFilePath, 'utf8');
@@ -1817,11 +1840,18 @@ async function runBot() {
 
         // Fallback to text analysis of QA result
         if (!qaPassed) {
+          const lowerResult = qaResult.toLowerCase();
           qaPassed =
-            qaResult.toLowerCase().includes('gate: pass') ||
-            qaResult.toLowerCase().includes('ready for done') ||
-            (qaResult.toLowerCase().includes('recommended status') &&
-              qaResult.toLowerCase().includes('ready for done'));
+            lowerResult.includes('gate: pass') ||
+            lowerResult.includes('ready for done') ||
+            lowerResult.includes('final assessment: pass') ||
+            lowerResult.includes('final validation: pass') ||
+            lowerResult.includes('final qa assessment: approved') ||
+            lowerResult.includes('qa approved') ||
+            lowerResult.includes('production-ready validation confirmed') ||
+            lowerResult.includes('recommended status') ||
+            (lowerResult.includes('recommended status') &&
+              lowerResult.includes('ready for done'));
         }
 
         if (!qaPassed) {
@@ -2138,6 +2168,26 @@ function parseChunkPriorityOrder(response, chunks) {
 }
 
 /**
+ * Run architect agent to design solution architecture for a story
+ */
+async function runArchitectForStory(story) {
+  logInfo(`🏗️ Architect designing solution for: ${story.filename}`);
+  setCurrentOperation('architect', story.path);
+  try {
+    await runBMADAgent(
+      'architect',
+      'design solution architecture and write detailed implementation plan to the story file',
+      story.path,
+      { allowCode: false } // Documentation only
+    );
+  } finally {
+    clearCurrentOperation();
+  }
+  const contentAfterArchitect = fs.readFileSync(story.path, 'utf8');
+  detectContentLoops(story.path, contentAfterArchitect);
+}
+
+/**
  * Helper function to perform SM splitting - only for PM-approved stories
  */
 async function performSMSplitting(story) {
@@ -2255,6 +2305,15 @@ Create the split stories NOW if splitting is needed.`,
       // Write back the enhanced content
       fs.writeFileSync(splitPath, enhancedContent);
 
+      // Create story object for architect
+      const splitStoryObj = {
+        path: splitPath,
+        filename: splitFile,
+      };
+
+      // Run architect to design solution before marking as refined
+      await runArchitectForStory(splitStoryObj);
+
       // Mark split story as REFINED (ready for implementation)
       const splitStoryKey = splitFile.replace(/\.md$/, '');
       const state = loadWorkflowState();
@@ -2282,6 +2341,9 @@ Create the split stories NOW if splitting is needed.`,
     // Add SM analysis to the story
     const smSection = `\n## ✂️ SM Splitting Analysis\n\n${smOutput.trim()}\n`;
     fs.appendFileSync(story.path, smSection);
+
+    // Run architect to design solution before marking as refined
+    await runArchitectForStory(story);
 
     // Mark as refined
     await updateStoryWorkflowStateAtomic(
@@ -2905,6 +2967,42 @@ REVIEW FILE FORMAT:
 // Global shutdown flag - set to true when SIGINT/SIGTERM received
 let shutdownRequested = false;
 
+// Global current operation tracking for graceful shutdown
+let currentOperation = {
+  stage: null, // 'dev', 'qa', 'architect', etc.
+  storyPath: null,
+  startTime: null,
+};
+
+/**
+ * Set current operation stage for graceful shutdown tracking
+ */
+function setCurrentOperation(stage, storyPath) {
+  currentOperation = {
+    stage,
+    storyPath,
+    startTime: Date.now(),
+  };
+  logInfo(`🔄 Started ${stage} operation for ${path.basename(storyPath)}`);
+}
+
+/**
+ * Clear current operation stage
+ */
+function clearCurrentOperation() {
+  if (currentOperation.stage) {
+    const duration = Date.now() - currentOperation.startTime;
+    logInfo(
+      `✅ Completed ${currentOperation.stage} operation for ${path.basename(currentOperation.storyPath)} (${Math.round(duration / 1000)}s)`
+    );
+  }
+  currentOperation = {
+    stage: null,
+    storyPath: null,
+    startTime: null,
+  };
+}
+
 // Global orchestrator instance lock to prevent multiple concurrent instances
 let orchestratorInstanceLock = null;
 
@@ -3043,6 +3141,56 @@ async function gracefulShutdown(signal, exitCode) {
   shutdownRequested = true; // Set global shutdown flag
 
   const instanceId = process.env.BMAD_INSTANCE_ID || 'default';
+
+  // Special handling for dev and architect stages - wait for critical operations to complete
+  if (
+    currentOperation.stage === 'dev' ||
+    currentOperation.stage === 'architect'
+  ) {
+    const stageName = currentOperation.stage.toUpperCase();
+    const action =
+      currentOperation.stage === 'dev'
+        ? 'writing code'
+        : 'designing architecture';
+    console.log(
+      `🛠️  ${stageName} STAGE DETECTED: Waiting for current ${currentOperation.stage} operation to complete before shutdown...`
+    );
+    console.log(
+      `📝 Allowing ${path.basename(currentOperation.storyPath)} ${currentOperation.stage} task to finish ${action}`
+    );
+
+    // Wait up to 5 minutes for operation to complete
+    const maxWaitTime = 10 * 60 * 1000; // 10 minutes
+    const waitStartTime = Date.now();
+    const initialStage = currentOperation.stage;
+
+    while (
+      (currentOperation.stage === 'dev' ||
+        currentOperation.stage === 'architect') &&
+      Date.now() - waitStartTime < maxWaitTime
+    ) {
+      console.log(
+        `⏳ Waiting for ${currentOperation.stage} operation to complete... (${Math.round((Date.now() - waitStartTime) / 1000)}s elapsed)`
+      );
+      await new Promise((resolve) => setTimeout(resolve, 5000)); // Check every 5 seconds
+    }
+
+    if (currentOperation.stage === initialStage) {
+      console.log(
+        `⏰ ${initialStage.toUpperCase()} operation still running after ${Math.round(maxWaitTime / 1000)}s - proceeding with force shutdown`
+      );
+      if (initialStage === 'dev') {
+        console.log(`⚠️  Code changes may be incomplete or corrupted`);
+      } else {
+        console.log(`⚠️  Architecture design may be incomplete`);
+      }
+    } else {
+      console.log(
+        `✅ ${initialStage.toUpperCase()} operation completed gracefully before shutdown`
+      );
+    }
+  }
+
   console.log(
     `🛑 Terminating ${activeProcesses.size} agent processes for instance ${instanceId}...`
   );
