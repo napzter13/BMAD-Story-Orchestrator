@@ -1112,9 +1112,9 @@ function runBMADAgentImmediate(agentType, command, storyPath, options = {}) {
     analyst: 900000, // 15 minutes base for analysis
     pm: 600000, // 10 minutes base for review
     sm: 450000, // 7.5 minutes base for splitting
-    architect: 1200000, // 20 minutes base for design
+    architect: 1800000, // 30 minutes base for design
     dev: 1800000, // 30 minutes base for development
-    qa: 900000, // 15 minutes base for testing
+    qa: 1800000, // 30 minutes base for testing
   };
 
   // Calculate adaptive timeout based on story size and complexity
@@ -1174,7 +1174,7 @@ function runBMADAgentImmediate(agentType, command, storyPath, options = {}) {
       'agent',
       '--model',
       AI_MODEL,
-      '--force', // Force allow commands without prompting
+      agentType == 'qa' ? '--force' : '', // Force allow commands without prompting for qa
     ];
 
     const agentProcess = spawn('cursor-agent', agentArgs, {
@@ -1824,7 +1824,7 @@ async function runBot() {
         try {
           devResult = await runBMADAgent(
             'dev',
-            `develop "/apps/web/stories/${story.filename}". Run relevant tests and builds, and fix errors automatically. Summarize changes made in the story file so QA can review what was implemented.`,
+            `develop "/apps/web/stories/${story.filename}". Summarize changes made in the story file so QA can review what was implemented.`,
             story.path,
             {
               allowCode: true,
