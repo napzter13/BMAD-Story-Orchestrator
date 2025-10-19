@@ -1174,9 +1174,6 @@ function runBMADAgentImmediate(agentType, command, storyPath, options = {}) {
       'agent',
       '--model',
       AI_MODEL,
-      '--print',
-      '--output-format',
-      'text',
       '--force', // Force allow commands without prompting
     ];
 
@@ -1827,7 +1824,7 @@ async function runBot() {
         try {
           devResult = await runBMADAgent(
             'dev',
-            `develop "/apps/web/stories/${story.filename}". Summarize changes made in the story file so QA can review what was implemented.`,
+            `develop "/apps/web/stories/${story.filename}". Run relevant tests and builds, and fix errors automatically. Summarize changes made in the story file so QA can review what was implemented.`,
             story.path,
             {
               allowCode: true,
@@ -1846,7 +1843,7 @@ async function runBot() {
         try {
           qaResult = await runBMADAgent(
             'qa',
-            `review "/apps/web/stories/${story.filename}". Run all relevant tests, builds, and quality checks automatically. Write QA Results to the story file and to gate file ("/docs/qa/gates/${gateSlug}.yml").`,
+            `review "/apps/web/stories/${story.filename}". Run relevant tests, builds, and quality checks automatically. Write QA Results to the story file and to gate file ("/docs/qa/gates/${gateSlug}.yml").`,
             story.path,
             {
               allowCode: true, // Allow QA to refactor code if appropriate
