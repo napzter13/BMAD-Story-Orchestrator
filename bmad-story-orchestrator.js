@@ -1818,7 +1818,7 @@ async function runBot() {
         try {
           await runBMADAgent(
             'dev',
-            `develop-story ${storyKey} and summarize all changes made to the story file so QA can review what was implemented`,
+            `develop "/apps/web/stories/${story.filename}". (and summarize changes made to the story file so QA can review what was implemented)`,
             story.path,
             {
               allowCode: true,
@@ -1836,7 +1836,7 @@ async function runBot() {
         try {
           qaResult = await runBMADAgent(
             'qa',
-            `review "${story.filename}". (Write QA Results to the story file and gate file ("${gateFilePath}"))`,
+            `review "/apps/web/stories/${story.filename}". (and write QA Results to the story file and to gate file ("/apps/web/stories/${gateSlug}.yml"))`,
             story.path,
             {
               allowCode: true, // Allow QA to refactor code if appropriate
