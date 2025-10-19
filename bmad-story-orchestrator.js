@@ -57,19 +57,19 @@ const ORCHESTRATOR_INSTANCE_LOCK_FILE = path.join(
 
 // Global process queue and tracking
 let processQueue = [];
-let activeProcesses = new Map(); // pid -> process info
+const activeProcesses = new Map(); // pid -> process info
 let processQueueInterval = null;
 let processCleanupInterval = null;
 
 // Health monitoring and circuit breaker state
 let healthMonitorInterval = null;
-let circuitBreakerState = {
+const circuitBreakerState = {
   isOpen: false,
   failureCount: 0,
   lastFailureTime: 0,
   lastAttemptTime: 0,
 };
-let systemHealth = {
+const systemHealth = {
   memoryUsage: 0,
   cpuUsage: 0,
   activeProcesses: 0,
@@ -79,7 +79,7 @@ let systemHealth = {
 };
 
 // Metrics tracking
-let systemMetrics = {
+const systemMetrics = {
   startTime: Date.now(),
   totalProcessesStarted: 0,
   totalProcessesCompleted: 0,
@@ -665,7 +665,7 @@ function logHealthStatus() {
   const memPercent = Math.round(systemHealth.memoryUsage * 100);
   const cpuPercent = Math.round(systemHealth.cpuUsage * 100);
 
-  let message = `🏥 Health: ${status} | Mem: ${memPercent}% | CPU: ${cpuPercent}% | Active: ${systemHealth.activeProcesses} | Queued: ${systemHealth.queuedProcesses}`;
+  const message = `🏥 Health: ${status} | Mem: ${memPercent}% | CPU: ${cpuPercent}% | Active: ${systemHealth.activeProcesses} | Queued: ${systemHealth.queuedProcesses}`;
 
   if (circuitBreakerState.isOpen) {
     logError(message);
@@ -1169,21 +1169,30 @@ function runBMADAgentImmediate(agentType, command, storyPath, options = {}) {
       return;
     }
 
-    // Create the agent process with proper environment isolation
-    let agentProcess = spawn(
-      'cursor-agent',
-      ['agent', '--model', AI_MODEL, '--print', '--output-format', 'text'],
-      {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        cwd: process.cwd(),
-        env: {
-          ...process.env,
-          BMAD_AGENT_TYPE: agentType,
-          BMAD_INSTANCE_ID: process.env.BMAD_INSTANCE_ID || 'default',
-          BMAD_PARENT_PID: process.pid.toString(),
-        },
-      }
-    );
+    // Create the agent process with proper environment isolation and auto-command execution
+    const agentArgs = [
+      'agent',
+      '--model',
+      AI_MODEL,
+      '--print',
+      '--output-format',
+      'text',
+      '--force', // Force allow commands without prompting
+    ];
+
+    const agentProcess = spawn('cursor-agent', agentArgs, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        BMAD_AGENT_TYPE: agentType,
+        BMAD_INSTANCE_ID: process.env.BMAD_INSTANCE_ID || 'default',
+        BMAD_PARENT_PID: process.pid.toString(),
+        // Enable automatic command execution without user approval
+        CURSOR_AGENT_AUTO_APPROVE_COMMANDS: 'true',
+        CURSOR_AGENT_SANDBOX_POLICY: 'workspace_readwrite',
+      },
+    });
 
     // Track the process for cleanup
     activeProcesses.set(agentProcess.pid, {
@@ -1199,7 +1208,7 @@ function runBMADAgentImmediate(agentType, command, storyPath, options = {}) {
     let timeoutId;
     let heartbeatId;
     let isCompleted = false;
-    let startTime = Date.now();
+    const startTime = Date.now();
 
     // Handle stdout
     agentProcess.stdout.on('data', (data) => {
@@ -1790,7 +1799,7 @@ async function runBot() {
         .join('.')
         .toLowerCase()
         .replace(/\./g, '-');
-      const gateSlug = firstPart + '-' + restPart;
+      const gateSlug = firstPart.toLowerCase() + '-' + restPart;
       const gateFilePath = path.join(qaDir, 'gates', `${gateSlug}.yml`);
 
       if (fs.existsSync(gateFilePath)) {
@@ -1812,18 +1821,19 @@ async function runBot() {
         cycleCount++;
         logInfo(`🔄 Implementation cycle ${cycleCount} for: ${story.filename}`);
 
-        // Dev - develop and summarize changes
-        const storyKey = story.filename.replace(/\.md$/, '');
+        // Dev - develop, run tests automatically, and summarize changes
         setCurrentOperation('dev', story.path);
+        let devResult;
         try {
-          await runBMADAgent(
+          devResult = await runBMADAgent(
             'dev',
-            `develop "/apps/web/stories/${story.filename}". (and summarize changes made to the story file so QA can review what was implemented)`,
+            `develop "/apps/web/stories/${story.filename}". Run all relevant tests and builds automatically. If tests fail, fix the issues and re-run tests until they pass. Summarize all changes made and test results in the story file so QA can review what was implemented.`,
             story.path,
             {
               allowCode: true,
             }
           ); // CODE ALLOWED
+          logInfo(`Dev Result: ${devResult}`);
         } finally {
           clearCurrentOperation();
         }
@@ -1836,12 +1846,13 @@ async function runBot() {
         try {
           qaResult = await runBMADAgent(
             'qa',
-            `review "/apps/web/stories/${story.filename}". (and write QA Results to the story file and to gate file ("/apps/web/stories/${gateSlug}.yml"))`,
+            `review "/apps/web/stories/${story.filename}". Run all relevant tests, builds, and quality checks automatically. Execute comprehensive testing including unit tests, integration tests, linting, and any other quality gates. Write QA Results to the story file and to gate file ("/docs/qa/gates/${gateSlug}.yml").`,
             story.path,
             {
               allowCode: true, // Allow QA to refactor code if appropriate
             }
           );
+          logInfo(`QA Result: ${qaResult}`);
         } finally {
           clearCurrentOperation();
         }
@@ -2034,7 +2045,7 @@ function parseStoryChunks(response, allStories) {
     // Look for chunk headers (numbered items, bold text, etc.)
     const chunkMatch =
       line.match(/^(\d+)\.?\s*\*\*?(.+?)\*\*?:\s*(.+)?$/) ||
-      line.match(/^[\*\-\•]\s*\*\*?(.+?)\*\*?:\s*(.+)?$/) ||
+      line.match(/^[*\-•]\s*\*\*?(.+?)\*\*?:\s*(.+)?$/) ||
       line.match(/^#+\s*(.+?)(?:\s*-\s*(.+))?$/);
 
     if (chunkMatch) {
@@ -2050,7 +2061,7 @@ function parseStoryChunks(response, allStories) {
         rationale: description.trim(),
         stories: [],
       };
-    } else if (currentChunk && line.match(/^[•\-\*]\s*(.+?\.md)/)) {
+    } else if (currentChunk && line.match(/^[•\-*]\s*(.+?\.md)/)) {
       // Story reference within current chunk
       const storyMatch = line.match(/(.+?\.md)/);
       if (storyMatch) {
@@ -2173,7 +2184,7 @@ function parseChunkPriorityOrder(response, chunks) {
     // Look for numbered priority order
     const priorityMatch =
       line.match(/^(\d+)\.?\s*\*\*?(.+?)\*\*?/) ||
-      line.match(/^[\•\-\*]\s*(.+?)(?:\s*-|:)/);
+      line.match(/^[•\-*]\s*(.+?)(?:\s*-|:)/);
 
     if (priorityMatch) {
       const chunkName = priorityMatch[1] || priorityMatch[2];
@@ -2290,7 +2301,7 @@ Create the split stories NOW if splitting is needed.`,
       logInfo(`  📄 ${splitFile}`);
 
       // Read the split story content
-      let splitContent = fs.readFileSync(splitPath, 'utf8');
+      const splitContent = fs.readFileSync(splitPath, 'utf8');
 
       // Ensure all preserved sections are included
       let enhancedContent = splitContent;
@@ -3102,58 +3113,6 @@ function releaseOrchestratorInstanceLock() {
       );
     }
     orchestratorInstanceLock = null;
-  }
-}
-
-// Function to kill all active child processes
-function killAllChildProcesses(signal = 'SIGTERM') {
-  if (activeChildProcesses.size > 0) {
-    console.log(
-      `\n🛑 EMERGENCY SHUTDOWN: Killing ${activeChildProcesses.size} active agent processes to prevent token waste...`
-    );
-    console.log(
-      `${'🚨'.repeat(20)} COST PROTECTION ACTIVATED ${'🚨'.repeat(20)}`
-    );
-
-    for (const [agentType, child] of activeChildProcesses) {
-      try {
-        console.log(
-          `💀 FORCE-KILLING ${agentType} agent (PID: ${child.pid}) with ${signal}`
-        );
-        child.kill(signal);
-
-        // Also try SIGKILL if SIGTERM doesn't work quickly
-        setTimeout(() => {
-          try {
-            if (!child.killed) {
-              console.log(
-                `🔪 SIGKILL ${agentType} agent (PID: ${child.pid}) - wasn't responding to ${signal}`
-              );
-              child.kill('SIGKILL');
-            }
-          } catch (killError) {
-            // Process might already be dead
-          }
-        }, 500);
-      } catch (error) {
-        console.error(`❌ Failed to kill ${agentType} agent: ${error.message}`);
-      }
-    }
-    activeChildProcesses.clear();
-
-    // Give processes time to terminate cleanly
-    setTimeout(() => {
-      console.log(
-        `✅ All agent processes terminated - token consumption stopped`
-      );
-      console.log(
-        `${'💰'.repeat(20)} COST PROTECTION SUCCESSFUL ${'💰'.repeat(20)}`
-      );
-      process.exit(0);
-    }, 2000);
-  } else {
-    console.log(`✅ No active agent processes to clean up`);
-    process.exit(0);
   }
 }
 
