@@ -1827,7 +1827,7 @@ async function runBot() {
         try {
           devResult = await runBMADAgent(
             'dev',
-            `develop "/apps/web/stories/${story.filename}". Run all relevant tests and builds automatically. If tests fail, fix the issues and re-run tests until they pass. Summarize all changes made and test results in the story file so QA can review what was implemented.`,
+            `develop "/apps/web/stories/${story.filename}". Summarize changes made in the story file so QA can review what was implemented.`,
             story.path,
             {
               allowCode: true,
@@ -1846,7 +1846,7 @@ async function runBot() {
         try {
           qaResult = await runBMADAgent(
             'qa',
-            `review "/apps/web/stories/${story.filename}". Run all relevant tests, builds, and quality checks automatically. Execute comprehensive testing including unit tests, integration tests, linting, and any other quality gates. Write QA Results to the story file and to gate file ("/docs/qa/gates/${gateSlug}.yml").`,
+            `review "/apps/web/stories/${story.filename}". Run all relevant tests, builds, and quality checks automatically. Write QA Results to the story file and to gate file ("/docs/qa/gates/${gateSlug}.yml").`,
             story.path,
             {
               allowCode: true, // Allow QA to refactor code if appropriate
